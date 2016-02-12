@@ -1,0 +1,895 @@
+  '****************************************************************************
+'*  Date    : 6/6/2007                                                        *  
+'*  Version : 1.0  Modified version of Rev 5 from ME labs, Rev 2 is for working on the Vaisala PTH module *                                         
+'*  Notes   : Radiosonde firmware for 18F2520                                 *
+'*  Update a: change CC1070 cofiguratin regestors for external Osc @19.8 MHz  *
+'*            changed default RF freq to 405.22, added: made ports            *
+'*            B.6 & B.7 input                                                 *
+'*  Update b: Added PLL lock test for CC1070 Init routine                     *
+'*  Update c: Development using ME Labs X-2 Proto board                       *
+'*    Ver 4   Changed data message to version 1.7                             *
+'******************************************************************************
+
+' Store default static values at program time in EEPROM.  Will be replaced
+' during manufacture.
+firmware_revision   DATA @0, WORD $0B02  'Format is Minor-Major (ver. Major.Minor/100)
+Sonde_ID            DATA @2, WORD $075B, word $CD15
+Frame_Type          DATA @6, $01    ' AVAPS II =1, MIST, etc., values TBD
+Freq_0A             DATA @20, $DD   ' Default frequency is 405.220 MHz
+Freq_1A             DATA @21, $75
+Freq_2A             DATA @22, $29
+frequency_offset    DATA @23, 0
+PA_Power            DATA @24, $FF   ' Maximum Power
+
+' Define interrupt handler
+DEFINE INTHAND myint
+DEFINE OSC 20
+DEFINE HSER_TXSTA 24h
+DEFINE HSER_RCSTA 90h
+DEFINE HSER_BAUD 38400          ' Match rate of GPS
+
+' Define ADCIN parameters
+Define  ADC_BITS        10      ' Set number of bits in result
+Define  ADC_CLOCK       1       ' Set clock source (Fosc/8)
+Define  ADC_SAMPLEUS    50      ' Set sampling time in uS
+
+'------------- Port Aliases Defined -------------------------------------------- 
+' Vaisala PTU Module port aliases
+CTS         var PORTB.1
+RTS         var PORTB.2
+PTH_Rx      var PORTB.3
+PTH_Tx      var PortB.5
+
+' Launch Detect port aliases
+Launch_Det      var PortB.6
+
+' Chipcon aliases
+CC1070_Data_Out var PORTC.5 ' CC1070 Data Output, used to read status of registers
+CC1070_Data_In  var PORTC.4 ' CC1070 Data Input, used to load data into registers
+CC1070_Clock    var PORTC.3 ' CC1070 Clock
+CC1070_PSEL     var PORTB.4 ' CC1070 P_Select
+
+' General Port aliases 
+LED             Var PORTB.0     ' Alias LED to PORTB.0
+progin          vAR PORTB.7     ' Alias serial data input for programming mode
+progout         VAR PORTB.6     ' Alias serial data output for programming mode
+RCIF            VAR PIR1.5      ' Usart receive flag
+TP1             var PortC.0     ' Used for testing/debugging
+
+'---------- Variables Defined --------------------------------------------------
+frame_count     VAR WORD        ' Number of frames transmitted
+gps_position    VAR BYTE        ' Byte sending when GPS receive finishes (0 to 149)
+ck_a            VAR BYTE        ' Used for Fletcher checksum
+ck_b            VAR BYTE        ' Used for Fletcher checksum
+Vbatt           VAR WORD        ' Battery Voltage
+freqA_low       VAR WORd        ' Low word of 24-bit frequency value (CC1070 init)
+freqA_high      VAR WORD
+freqA_offset    VAR BYTE        ' Frequency offset, signed byte -127 to 127
+PA_power_hold   VAR BYTE        ' Transmit power
+CC1070_Status   var byte        ' CC1070 Status register, used to determine PLL lock
+X               var byte        ' Temp value for a count in PTH read
+PTH_Coeff       var byte[256]  ' Added in TEST version, would use to hold PTU coeff.
+GPS_Data        var byte[60]   ' Added in TEST version, would hold GPS SOL message
+GPS_flag        var byte       ' GPS Flag
+PTU_Data        var byte[20]   ' PTU data from Vaisala module
+Launch_Flag     var byte
+Temp            var word        ' Used for calculating TX fequency offset in CC1070
+
+
+' Transmission rate constants used to adjust on the fly,
+fast            CON $FBFA       ' -1030    Prescaler=1, 20MHz/4= 5MHz clock
+coast           CON $FBF8       ' -1032    to get 4800 Hz  =>  5MHz/1032
+slow            CON $FBF6       ' -1034    final values were determined expermentally
+
+'Variables for saving state in interrupt handler
+wsave           VAR BYTE bankA system   ' Saves W
+ssave           VAR BYTE bankA system   ' Saves STATUS
+
+' Variables used in interrupt handler
+sending         VAR BYTE bankA      ' buffer location currently being transmitted (/2)
+' sending is incremented in the interrupt handler, +1 for every 2 bytes sent.
+' This gives a "position in frame" reference that we can check in the PBP code.
+' It counts 0 to 149 as a single 500mS frame is transmitted.
+bit_index       VAR BYTE bankA      ' Counter for bits in handler:
+' bit_index is used only in the interrupt handler.  It counts 0 to 7 (representing
+' bits of a transmit byte).  The handler checks this to know when a new byte should
+' be taken from the array.  It's also used in the handler as a dirty trick to
+' know when to increment the sending variable.
+output_byte     VAR BYTE bankA      ' Holds byte currently being sent:
+' output_byte is used as a temp variable only in the interrupt handler.  It holds
+' the byte currently being transmitted, shifting out one bit at a time. 
+output_period   VAR WORD bankA      ' Timer reload value determines baud rate:
+' output_period is used in the interrupt handler to load Timer1.  The higher this
+' value, the sooner the next interrupt.  It is adjusted in the PBP code to change
+' the output baud rate.
+
+buffer_location CON $100    ' Pick any location that fits, but always use this
+                            ' constant to set it.  This allows the init code
+                            ' below to set the FSR2 registers when starting up.
+                            ' This is using a inderect memory adderessing 
+                            ' feature of the PIC chip.
+
+buffer          VAR BYTE[300] buffer_location   ' Array variable for holding 
+' manchester encoded data.
+'   ****************** IMPORTANT Notes **************************************
+' The output data being sent is created by taking each data byte (8-bits)
+' adding a start/stop bit, so now each data byte is 10 bits long, the 10 bits
+' is now manchester encoded (2-bits manchester/1-bit data), so for each data
+' byte, this is now represented by 20 bits. If there are 120 characters to be
+' sent per frame, this equates to 20 bits x 120 char = 2400 TOTAL BITS. The 
+' 2400 bits are put into a byte array. Where the bits cross over 3 bytes in the
+' data array for each data byte of info (8 bits => 20 bits). The total number 
+' of bytes to be sent (after the conversion of adding the start/stop bit, 
+' conversion to manchester) is: 2400/8 = 300 bytes!! The sending of one byte of
+' info will cross over 2.5 bytes, there will always be a bit transistion from
+' one byte to the next at either the beginning of a byte or middle between bit
+' position 3 and 4.
+
+data_array      VAR BYTE[120]   ' Array for holding raw data (before Manchester)
+buffer_index    VAR WORD    ' byte location in buffer for PBP code
+buffer_bit      VAR BYTE    ' bit location in buffer for PBP code
+temp1_byte      VAR BYTE    ' byte-size temp variable
+data_byte       VAR BYTE    ' byte location in data_array
+data_bit        VAR BYTE    ' bit index for Manchester encode
+buffer_temp     VAR BYTE    ' temp storage for buffer byte
+prog_data       VAR BYTE[12]   ' Array to receive programming data string
+input_error     VAR BYTE       ' Error flag for validating serial programming input
+
+
+'-------------------------------------------------------------------------------
+frame_count = 0         ' Initialize frame count on power up or reset
+Launch_Flag = 0
+
+
+GoTo start  ' Skip around interrupt handler
+
+include "Manchester_ASM.pbp"  ' Assembly language INTERRUPT handler
+
+start:
+    ' *****************************************************************
+    ' Initialize values so the handler starts on exactly the 
+    ' correct bit and byte.  This insures that the "sending"
+    ' variable is in sync with the other pointers.  It also
+    ' avoids a corrupt data stream on the first pass through.
+    INTCON = 0      ' Disable interrupts in case of recovery attempt from gps_receive
+    T1CON = 0       ' Disable Timer1
+    PIR1.0 = 0      ' Make sure interrupt flag is clear
+    FSR2H = (buffer_location + 1) / 256     ' buffer index pointer, setup first
+                                            ' location in buffer array.
+    FSR2L = (buffer_location + 1) & $00FF
+    bit_index = 0                           ' bit pointer in output byte 
+    sending = 0                             ' /2 pointer for buffer index
+    output_byte = buffer[0]                 ' set up the output variable
+' *****************************************************************
+    
+' General initialization ***********************************************    
+    TRISA  = %11100001      ' Set PORTA A.0, A.5 to inputs, and A.1, A.2, A.3, A.4 to outputs
+    ADCON1 = %00001110      ' Don't care [00], Uses Vss and Vdd for reference [00],ports dig I/O except A0 [1110]
+    ADCON2.7 = 1            ' Right-justify result for 10-bit conversion
+    TRISC.2 = 0             ' Make RC2 an output
+    PORTC.2 = 1             ' Set RC2 high (help the receiver lock faster?)
+    TRISB.7 = 1             ' Make sure RB7 is an input so things will start up correctly
+    output_period = coast   ' Set 4800 baud (-1032) -1034=4790, -1030=4810
+    INTCON2.7 = 0	        ' Enable PORTB pull-ups this is used for the push button switch
+    
+'--------Set programming ports B.6 and B.7 to inputs for programming as the default ---------------------------
+  input PortB.6      ' Required so the PIC16F676 can be programmed 
+  input PortB.7
+  
+' Chipcon initialization
+    'GOSUB Init_CC1070       ' Get the transmitter going       
+    'gosub PLL_Lock_Test     ' Verfiy PLL Lock and reprogram if neccessary
+    
+' Retrieve values stored in Data Space
+    READ sonde_id, data_array[97]
+    READ sonde_id + 1, data_array[98]
+    READ sonde_id + 2, data_array[99]
+    READ sonde_id + 3, data_array[100]
+    READ firmware_revision, data_array[101]
+    READ firmware_revision + 1, data_array[102]
+    READ Frame_Type, data_array[4]
+
+' Load static values into the data array from Code Space
+    GOSUB refresh_array
+    
+
+' Wait for the first gps string to pass before starting everything up
+' Use the Hserin timeout to tweak the appoximate position of the gps 
+' receive in the first frame.
+    If (RCSTA.1 = 1) OR (RCSTA.2 = 1) Then
+        RCSTA.4 = 0
+        RCSTA.4 = 1
+    ENDIF  
+
+wait_first_gps:
+    If RCIF = 0 Then wait_first_gps
+    HSERIN 150, usart_clear1, [wait("for timeout")]' Continue only when Rx line 
+                                                   ' has been idle for 150mS
+usart_clear1:
+
+'------Set LED on PCB to blink in run mode and be ON during RS-232 communications
+    LOW LED                 ' LED off and make output
+    GPS_Flag=0
+    data_array[104] = 0 ' Set Launch Frame Count to zero
+    data_array[105] = 0
+    
+' Start the timer and enable interrupts
+    TMR1L = 0
+    TMR1H = 0
+    T1CON = $81         ' Turn on Timer1, prescaler = 1, 16-bit access mode
+    INTCON  = $C0       ' Enable global interrupts, peripheral interrupts
+    PIE1 = $01          ' Enable TMR1 overflow interrupt
+
+    
+' ************************* Main Program Loop ******************************
+' **************************************************************************
+' **************************************************************************
+loop:
+    'IF progin = 1 Then program_mode  ' Check for serial programming connection
+                            ' for manufacturing mode via RS-232
+    high TP1                        
+    toggle LED              ' Toggle LED through loop to show heartbeat          
+    GOSub refresh_array     ' 120uSec - Load static values to protect against corruption in data_array, this takes 200 usec    
+    
+    '----------------- Start PTH Measurment ------------------------------------
+    high CTS
+    serout2 PTH_TX, 32, ["M", 13, 10]  ' 1615 usec - Start measurment process for PTH data
+    low TP1
+    '----------------- Check for GPS Message -----------------------------------
+    While sending < 50      ' Check GPS u-Blox reciever for first GPS message
+     IF RCIF = 1 Then GOSUb gps_receive      ' Keep checking for RCIF
+    wend 
+    GPS_Flag=1   
+    high TP1
+    ' Use on-board ADC to check battery voltage, this takes 74 usec    
+    ADCIN 0, Vbatt          ' Read AN0 for voltage
+    Vbatt = 1650 */ Vbatt   ' Do math to convert reading to milivolts
+    data_array[106] = Vbatt.Lowbyte    ' Store the battery data in the array
+    data_array[107] = Vbatt.Highbyte         
+    
+    data_array[5] = frame_count.Lowbyte    ' Store the first framecount in the array
+    data_array[6] = frame_count.Highbyte   ' This step takes 1.2usec
+    low TP1
+' Wait here until specified byte starts to send.  This syncronizes the Manchester
+' encode so that it starts while the last bytes are being sent and finishes
+' while the first bytes are being sent.  Avoids overwriting unsent data.
+
+While sending < 120        ' Check GPS u-Blox reciever for second GPS message & hold data frame at 120/150 into the 500 msec frame.
+     IF RCIF = 1 Then GOSUb gps_receive      ' Keep checking for RCIF
+wend
+
+GPS_Flag=0
+ ' ************** GET PTU Data  *************************
+   Wait_PTU_Data:  'Get PTU Data
+    IF RTS=1 then 
+        if sending>140 then No_PTU_Data
+        goto Wait_PTU_Data
+    endif
+    high TP1
+    low CTS      'Set CTS line Low           
+    'serin2 RX, 32, 10, No_PTU_Data, [STR data_array\20]
+    'The lines commented out below will not work       
+    'serin2 Serial_Rx, 84, 10, No_PTU_Data, [STR PTU_data\20]
+    'serin2 Serial_Rx, 84, [STR PTU_data\20]
+    'serin Serial_Rx, 84,  data_array[56],data_array[57],data_array[58],data_array[59],data_array[60],data_array[61],data_array[62],data_array[63],data_array[64],data_array[65],data_array[66],data_array[67],data_array[68],data_array[69],data_array[70],data_array[71],data_array[105],data_array[106],data_array[107],data_array[108]
+    
+    ' To read in the serial data below is takes 10.45msec
+    serin2 PTH_Rx, 32, 10, No_PTU_Data,[ data_array[9],data_array[10],data_array[11],data_array[12],data_array[13],data_array[14],data_array[15],data_array[16],data_array[17],data_array[18],data_array[19],data_array[20],data_array[21],data_array[22],data_array[23],data_array[24],data_array[108],data_array[109],data_array[110],data_array[111] ]    
+    No_PTU_Data:
+    
+'    serout2 PortC.1, 32, [dec sending, 13,10]    ' By adding this line in, it will create TX errors of the 2400 baud data
+ 
+    '-------- Calculate Fletcher Checksum for each block, total time for all blocks 508usec
+    ' Calculate first Fletcher checksum on bytes 4 through 6
+    ck_a = 0
+    ck_b = 0
+    For data_byte = 4 to 6
+        ck_a = ck_a + data_array[data_byte]
+        ck_b = ck_b + ck_a  
+    Next data_byte
+    data_array[7] = ck_a   ' Store checksum in data array
+    data_array[8] = ck_b
+
+    ' Calculate second Fletcher checksum on bytes 9 to 25
+    ck_a = 0
+    ck_b = 0
+    For data_byte = 9 to 25
+        ck_a = ck_a + data_array[data_byte]
+        ck_b = ck_b + ck_a
+    Next data_byte
+    data_array[26] = ck_a  ' Store checksum in data array
+    data_array[27] = ck_b
+ 
+  ' Calculate third Fletcher checksum on bytes 28 to 74
+    ck_a = 0
+    ck_b = 0
+    For data_byte = 28 to 74
+        ck_a = ck_a + data_array[data_byte]
+        ck_b = ck_b + ck_a
+    Next data_byte
+    data_array[75] = ck_a  ' Store checksum in data array
+    data_array[76] = ck_b   
+
+    ' Calculate forth Fletcher checksum on bytes 77 to 94
+    ck_a = 0
+    ck_b = 0
+    For data_byte = 77  to 94
+        ck_a = ck_a + data_array[data_byte]
+        ck_b = ck_b + ck_a
+    Next data_byte
+    data_array[95] = ck_a  ' Store checksum in data array
+    data_array[96 ] = ck_b 
+    
+' Calculate fifth Fletcher checksum on bytes 97 to 117   
+    ck_a = 0
+    ck_b = 0
+    For data_byte = 97  to 117
+        ck_a = ck_a + data_array[data_byte]
+        ck_b = ck_b + ck_a
+    Next data_byte
+    data_array[118] = ck_a  ' Store checksum in data array
+    data_array[119] = ck_b
+  
+    'Launch Detect
+    If Launch_Det=0 and Launch_Flag=0 then  ' Currenlty a push button switch on X-2 board
+        data_array[104] = frame_count.Lowbyte
+        data_array[105] = frame_count.Highbyte
+        Launch_Flag=1
+    endif
+    low TP1
+    '-------------- This keeps the frame in sync to 0.5 second data frame ------    
+    While sending < 144 
+    wend
+       
+    high TP1 
+    GOSUB mancharray    ' Encode the data array into the buffer array, time=38msec
+    IF RCIF = 1 THEN start  ' If we see the GPS receive here, that's bad.  Try to recover, start over.                 
+    frame_count = frame_count + 1           ' Increment frame count
+    low TP1  
+GOTO loop           ' Next frame  END of Main Loop
+' **************************************************************************
+' **************************************************************************
+' **************************************************************************
+' **************************************************************************
+data 
+refresh_array:
+    ' Refresh data_array with static values from Code Space
+    ' Frame Sync 0-4
+    For data_byte = 0 to 3
+            Lookup data_byte, [$1a,$cf,$fc,$1d], temp1_byte 
+            data_array[data_byte] = temp1_byte
+    Next data_byte
+    
+    ' Sonde Status
+    data_array[103] = $01   ' to be added later
+   
+    ' Clear PTU buffer, set data bytes to 0, thus if PTU module failed, null data would be TX
+    for data_byte = 9 to 25  
+        data_array[data_byte] = 0
+    next data_byte
+    for data_byte = 108 to 111  'Set Internal Temp data bytes to 0
+        data_array[data_byte] = 0
+    next data_byte
+     
+    ' Spare A/D Channels, currently not used.
+    ' A/D Sensor #1
+    data_array[112] = $0A
+    data_array[113] = $00
+    ' A/D Sensor #2
+    data_array[114] = $0B
+    data_array[115] = $00
+    ' A/D Sensor #3
+    data_array[116] = $0C
+    data_array[117] = $00
+
+RETURN
+
+
+' GPS receive subroutine ***************************************************
+' Get 60 character string from GPS
+gps_receive:    ' This process takes 17 msec
+    data_byte = 0           ' Starting GPS loaction in GPS_Data array
+    high TP1
+wait_for_gps:
+    Hserin 1, no_gps, [GPS_data[data_byte]]   ' Read and store a byte
+    data_byte = data_byte + 1                   ' Increment array location
+    If data_byte < 60 then wait_for_gps         ' Don't let it wreck the array
+
+no_gps:
+    ' Wait for 1mS of idle time on the line before continuing.
+    ' This insures that the USART buffer is empty for the next receive.
+    Hserin 1,usart_clear, [wait("for timeout")] ' Never satisfied
+usart_clear:
+
+    ' Check for USART errors and clear if found
+    If (RCSTA.1 = 1) OR (RCSTA.2 = 1) Then
+        RCSTA.4 = 0         ' Disable receive
+        RCSTA.4 = 1         ' Enable receive
+    ENDIF
+    if GPS_Flag=1 then Skip_GPS_Lock:
+    ' Massage the data rate to keep the GPS receive event from walking out
+    ' of the data frame.
+    gps_position = sending      ' Record the time relative to the beginning of the frame
+    SELECT CASE output_period   ' Handle any speed correction based on the current speed setting
+
+        CASE coast              ' If we're coasting at normal speed
+            IF gps_position < 25 THEN   ' If the gps string arrived too early
+                INTCON = 0              ' Disable the interrupt
+                output_period = fast    ' Speed up the data rate   
+                INTCON = $C0            ' Enable interrupt
+            ENDIF
+            IF gps_position > 75 THEN  ' If the gps string arrived too late 
+                INTCON = 0              ' Disable the interrupt
+                output_period = slow    ' Slow the data rate
+                INTCON = $C0            ' Enable the interrupt
+            ENDIF
+            'serout2 PortC.1, 32, ["2, ",dec gps_position,", ",dec frame_count,", ", dec GPS_data[53],13,10]
+            
+        CASE fast               ' If we're already running the fast data rate
+            If gps_position > 50 Then   ' If the gps string arrived late enough
+                INTCON = 0              ' Disable the interrupt
+                output_period = coast   ' Go back to normal data rate
+                INTCON = $C0            ' Enable the interrupt
+            ENDIF
+            'serout2 PortC.1, 32, ["3, ",dec gps_position,", ",dec frame_count,", ", dec GPS_data[53],13,10]
+            
+        CASE slow               ' If we're already running the slow data rate
+            IF gps_position < 50 THEN   ' If the gps string arrived early enough
+                INTCON = 0              ' Disable the interrupt
+                output_period = coast   ' Go back to normal data rate
+                INTCON = $C0            ' Enable the interrupt            
+            ENDIF
+            'Serout2 PortC.1, 32, ["1, ",dec gps_position,", ",dec frame_count,", ", dec GPS_data[53], 13, 10]
+    END SELECT
+    Skip_GPS_Lock:
+    ' Select custom GPS message from SOL u-Blox string
+    if GPS_Flag=0 then
+            'Long GPS Message Position and Velolicty info 
+            For data_byte = 6 to 51
+    			 data_array[data_byte+22]= GPS_Data[data_byte]
+    		next data_byte
+			data_array[74]= GPS_Data[53]		
+      else
+            ' Short GPS Message, Velocity info only
+            data_array[77]= GPS_Data[16]
+			For data_byte = 34 to 49
+    			 data_array[data_byte+44]= GPS_Data[data_byte]
+            next data_byte  		
+			data_array[94]= GPS_Data[53]
+    endif
+    ' Testing serout2 PortC.1, 32, [dec sending, 13,10]    ' By adding this line in, it will create TX errors of the 2400 baud data  		
+    low TP1	       
+RETURN
+
+
+' Manchester subroutines **************************************************
+' Encode data_array to buffer, inserting start/stop bits along the way
+mancharray:
+    buffer_index = 0        ' buffer_index is the byte location in the encoded buffer
+    buffer_bit = 0          ' buffer_bit is the bit location in the encoded byte
+    For data_byte = 0 to 119            ' data_byte is the byte location in the raw data
+        temp1_byte = 0                      ' Add a Start Bit
+        GOSUB manchbit                      ' Encode it
+        temp1_byte = data_array[data_byte]  ' Move the byte from the data array into a temp variable
+        FOR data_bit = 0 to 7               ' Go though each bit
+            GOSUB manchbit                  ' Encode bit-0
+            temp1_byte = temp1_byte >> 1    ' Shift next bit into bit-0
+        Next data_bit                       ' Repeat (until end of byte)
+        temp1_byte = 1                      ' Add a Stop Bit
+        GOSUB manchbit                      ' Encode it
+    Next data_byte                      ' Next data byte (until end of data array)
+Return                      ' Back to business
+
+' Encode a Manchester bit into next 2 locations of buffer array
+' Because of the addition of Start/Stop bits, there's no good relationship between
+' the location of the bit in the data_array and location of the next two bits
+' in the encoded buffer.  That means that the bit location in the buffer array
+' must be tracked separately from that in the data array.  
+manchbit:
+    buffer_temp = buffer[buffer_index]          ' Move the current byte into a temp variable
+    buffer_temp.0[buffer_bit] = temp1_byte.0    ' Set current Manchester bit to the value of the data bit
+    buffer_temp.0[buffer_bit+1] = ~temp1_byte.0 ' Set current Manchester bit to the value of the data bit INVERTED
+    buffer[buffer_index] = buffer_temp          ' Move the temp variable back into the Manchester array
+    buffer_bit = buffer_bit + 2                 ' Increment the buffer bit pointer 2 places (Manchester bit)
+    If buffer_bit.3 = 1 Then                    ' If we're now pointed at bit-8, we need a new byte
+        buffer_bit = 0                          ' Reset the buffer bit pointer
+        buffer_index = buffer_index + 1         ' Increment the buffer byte pointer
+    ENDIF
+RETURN
+ 
+
+
+' CC1070 Routines ***********************************************************
+Init_CC1070:
+
+    ' Retrieve frequency and offset from EEPROM
+    READ Freq_2A, freqA_high
+    READ Freq_1A, freqA_low.highbyte
+    READ Freq_0A, freqA_low.lowbyte
+    READ frequency_offset, freqA_offset
+    READ PA_power, PA_power_hold
+    
+    ' Add signed offset byte to 24-bit unsigned frequency value
+    temp = freqA_low                                ' Save original word for over/underflow check
+    If freqA_offset.7 = 1 Then                      ' Offset is negative
+        freqA_low = freqA_low - ABS(freqA_offset)   ' Subtract absolute value of offset
+        IF freqA_low > Temp Then freqA_high = freqA_high - 1    ' Borrow if underflow occured
+    ELSE                                            ' Offset is positive
+        freqA_low = freqA_low + freqA_offset        ' Add value of offset
+        IF freqA_low < Temp THEN freqA_high = freqA_high + 1    ' Carry if overflow occurred
+    ENDIF
+
+    ' CC1070 Transmitter set up
+    high PortC.2     ' this is very important for reliable programming
+    low CC1070_PSEL  ' Sets the CC1070 Chips select high
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$00\7,$1\1,$80\8]   '  Reset CC1070
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$00\7,$1\1,$81\8]   '  Reset CC1070
+    pulsout  CC1070_PSEL, 10                                       
+    
+    ' Set main registor configurations
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$01\7,$1\1,$4A\8]   '  Interface
+    pulsout  CC1070_PSEL, 10 
+    'Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$02/7,$1/1,$2D/8]   '  Reset Register   DO NOT USE
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$04\7,$1\1,freqA_high.lowbyte\8]   '  FREQ_2A
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$05\7,$1\1,freqA_low.highbyte\8]   '  FREQ_1A
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$06\7,$1\1,freqA_low.lowbyte\8]   '  FREQ_OA
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$07\7,$1\1,$3E\8]   '  CLOCK_A   
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$08\7,$1\1,$27\8]   '  FREQ_2B
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$09\7,$1\1,$F3\8]   '  FREQ_1B
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$0A\7,$1\1,$33\8]   '  FREQ_OB
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$0B\7,$1\1,$3F\8]   '  CLOCK_B
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$0C\7,$1\1,$44\8]   '  VCO
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$0D\7,$1\1,$03\8]   '  Modem
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$0E\7,$1\1,$1E\8]   '  Deviation
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$15\7,$1\1,$20\8]   '  LOCK
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$17\7,$1\1,$07\8]   '  Analog
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$18\7,$1\1,$04\8]   '  Buff_Swing
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$19\7,$1\1,$02\8]   '  Buffer Current
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$1A\7,$1\1,$99\8]   '  PLL BW
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$1C\7,$1\1,PA_power_hold\8]   '  PA Power *************************
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$20\7,$1\1,$00\8]   '  Power Down
+    pulsout  CC1070_PSEL, 10 
+    
+    ' Calibration Sequence
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$00\7,$1\1,$11\8]   '  Turn OFF PA from MAIN Reg.
+    pulsout  CC1070_PSEL, 10 
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$1B\7,$1\1,$BC\8]   '  Calibrate
+    pulsout  CC1070_PSEL, 10 
+    Pause 50
+    Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$00\7,$1\1,$01\8]   '  Turn ON PA from MAIN Reg.
+    high CC1070_PSEL  ' Sets the CC1070 Chips select high
+return
+
+' Test for PLL Lock-up
+PLL_Lock_Test: 
+low CC1070_PSEL
+Shiftout    CC1070_Data_In, CC1070_Clock, 1, [$40\7,$0\1]   '  Read Status Registor
+shiftin     CC1070_Data_Out, CC1070_Clock, 0,[CC1070_Status] 
+high CC1070_PSEL  ' Sets the CC1070 Chips select high 
+if CC1070_Status.4=0 then
+  gosub Init_CC1070
+  goto PLL_Lock_Test  ' Repeat until the unit achieves PLL Lock
+endif
+return
+
+
+' Program mode access via software serial
+program_mode:
+    HIGH LED                            ' LED on
+    INTCON = 0                          ' Disable interrupts
+    SEROUT2 progout, 84, ["?",13,10]          ' Signal entry into programming mode
+wait_for_entry:
+    ' Start receiving data.  Wait 30 seconds before timeout
+    SERIN2 progin, 84, 30000, exit_prog, [STR prog_data\12\13]
+
+    ' Parse the received string in prog_data array
+    SELECT CASE prog_data[0]    ' Take action based on the first character: "W", "R", "E", or null 
+        CASE "W"                ' "W" indicates a write sequence
+            ' Write Transmit Frequency ("TF")
+            IF (prog_data[1] = "T") AND (prog_data[2] = "F") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 7 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+                    WRITE Freq_2A, prog_data[3]     
+                    WRITE Freq_1A, prog_data[5]
+                    WRITE Freq_0A, prog_data[7]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    GOSUB Init_CC1070       ' Get the transmitter going   
+                    goto wait_for_entry         ' Wait for next command
+                ENDIF
+            ENDIF
+    
+            ' Write Transmit Offset ("TO")
+            IF (prog_data[1] = "T") AND (prog_data[2] = "O") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 3 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+                    WRITE frequency_offset, prog_data[3]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    GOSUB Init_CC1070       ' Get the transmitter going   
+                    goto wait_for_entry         ' Wait for next command
+                ENDIF
+            ENDIF
+    
+            ' Write TX Power Level ("TP")
+            IF (prog_data[1] = "T") AND (prog_data[2] = "P") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 3 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+                    WRITE PA_Power, prog_data[3]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    GOSUB Init_CC1070       ' Get the transmitter going   
+                    goto wait_for_entry         ' Wait for next command
+                ENDIF
+            ENDIF
+    
+            ' Turn OFF CC1070 IC ("OF")    WOF  Write tx OFf
+            IF (prog_data[1] = "O") AND (prog_data[2] = "F") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 3 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+                    WRITE PA_Power, prog_data[3]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    GOSUB Init_CC1070       ' Get the transmitter going   
+                    goto wait_for_entry         ' Wait for next command
+                ENDIF
+            ENDIF
+    
+    
+    
+            ' Write Sonde ID ("ID")
+            IF (prog_data[1] = "I") AND (prog_data[2] = "D") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 5 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+                    WRITE sonde_id + 1, prog_data[3]
+                    WRITE sonde_id, prog_data[5]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    goto wait_for_entry         ' Wait for next command
+               ENDIF
+            ENDIF
+    
+            ' Write Sensor Coefficients #1 ("C1")
+            IF (prog_data[1] = "C") AND (prog_data[2] = "1") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 9 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+               '     WRITE cal_coeff_1 + 3, prog_data[3]
+               '     WRITE cal_coeff_1 + 2, prog_data[5]
+               '     WRITE cal_coeff_1 + 1, prog_data[7]
+               '     WRITE cal_coeff_1, prog_data[9]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    goto wait_for_entry         ' Wait for next command
+               ENDIF
+            ENDIF
+    
+            ' Write Sensor Coefficients #2 ("C2")
+            IF (prog_data[1] = "C") AND (prog_data[2] = "2") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 9 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+               '     WRITE cal_coeff_2 + 3, prog_data[3]
+               '     WRITE cal_coeff_2 + 2, prog_data[5]
+               '     WRITE cal_coeff_2 + 1, prog_data[7]
+               '     WRITE cal_coeff_2, prog_data[9]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    goto wait_for_entry         ' Wait for next command
+                ENDIF
+            ENDIF
+    
+            ' Write Sensor Coefficients #3 ("C3")
+            IF (prog_data[1] = "C") AND (prog_data[2] = "3") THEN
+                GOSUB hexify    ' Change the ASCII string to HEX numbers
+                If input_error > 9 THEN     ' Check for validation error
+                    ' Write data to EEPROM
+              '      WRITE cal_coeff_3 + 3, prog_data[3]
+              '      WRITE cal_coeff_3 + 2, prog_data[5]
+              '      WRITE cal_coeff_3 + 1, prog_data[7]
+              '      WRITE cal_coeff_3, prog_data[9]
+                    SEROUT2 progout, 84, [">",13,10]  ' Respond OK
+                    goto wait_for_entry         ' Wait for next command
+                ENDIF
+            ENDIF
+    
+        CASE "R"                    ' "R" indicates read command
+            ' Read Transmit Frequency ("TF")
+            IF (prog_data[1] = "T") AND (prog_data[2] = "F") THEN
+                ' Retrieve data from EEPROM and store in prog_data array
+                READ Freq_2A, prog_data[3]
+                READ Freq_1A, prog_data[5]
+                READ Freq_0A, prog_data[7]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], HEX2 prog_data[5], HEX2 prog_data[7], 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+         
+            ' Read Frequency Offset ("FO")
+            IF (prog_data[1] = "F") AND (prog_data[2] = "O") THEN
+                ' Retrieve data from EEPROM and store in prog_data array
+                READ frequency_offset, prog_data[3]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+            
+             ' Read RF Transmitter Power Level ("TP")
+            IF (prog_data[1] = "T") AND (prog_data[2] = "P") THEN
+                ' Retrieve data from EEPROM and store in prog_data array
+                READ PA_Power, prog_data[3]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+            
+            ' Read Sonde ID ("ID")
+            IF (prog_data[1] = "I") AND (prog_data[2] = "D") THEN
+                ' Retrieve data from EEPROM and store in prog_data array
+                READ sonde_id + 1, prog_data[3]
+                READ sonde_id, prog_data[5]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], HEX2 prog_data[5], 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+    
+            ' Read Sensor Coefficients ("SC")
+            IF (prog_data[1] = "S") AND (prog_data[2] = "C") THEN
+                ' Retrieve data from EEPROM and store in prog_data array
+          '      READ cal_coeff_1 + 3, prog_data[3]
+          '      READ cal_coeff_1 + 2, prog_data[5]
+          '      READ cal_coeff_1 + 1, prog_data[7]
+          '      READ cal_coeff_1, prog_data[9]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], HEX2 prog_data[5], HEX2 prog_data[7], HEX2 prog_data[9],","]
+                ' Retrieve data from EEPROM and store in prog_data array
+          '      READ cal_coeff_2 + 3, prog_data[3]
+          '      READ cal_coeff_2 + 2, prog_data[5]
+          '      READ cal_coeff_2 + 1, prog_data[7]
+          '      READ cal_coeff_2, prog_data[9]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], HEX2 prog_data[5], HEX2 prog_data[7], HEX2 prog_data[9],","]
+                ' Retrieve data from EEPROM and store in prog_data array
+          '      READ cal_coeff_3 + 3, prog_data[3]
+          '      READ cal_coeff_3 + 2, prog_data[5]
+          '      READ cal_coeff_3 + 1, prog_data[7]
+          '      READ cal_coeff_3, prog_data[9]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], HEX2 prog_data[5], HEX2 prog_data[7], HEX2 prog_data[9], 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+    
+            ' Read Firmware Version ("FV")
+            IF (prog_data[1] = "F") AND (prog_data[2] = "V") THEN
+                ' Retrieve data from EEPROM and store in prog_data array
+                READ firmware_revision + 1, prog_data[3]
+                READ firmware_revision, prog_data[5]
+                ' Send data
+                SEROUT2 progout, 84, [HEX2 prog_data[3], HEX2 prog_data[5], 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+    
+            ' Read Battery Voltage ("BV")
+            IF (prog_data[1] = "B") AND (prog_data[2] = "V") THEN
+                ' Use on-board ADC to check battery voltage
+                LOW PORTA.5             ' Pull the bottom of the divider to ground
+                ADCIN 0, Vbatt          ' Read AN0 for voltage
+                INPUT PORTA.5           ' Let the bottom of the divider float
+                Vbatt = 1650 */ Vbatt   ' Do math to convert reading to milivolts
+                ' Send data
+                SEROUT2 progout, 84, [HEX4 Vbatt, 13,10]
+                goto wait_for_entry         ' Wait for next command
+            ENDIF
+    
+            
+        ' Exit programming on "EXT" command
+        CASE "E"                        ' "E" indicates exit command
+            ' Verify the rest of Exit command ("XT")
+            IF(prog_data[1] = "X") AND (prog_data[2] = "T") Then
+                ' Send OK, tell the user to disconnect
+                SEROUT2 progout, 84, [">DISCONNECT CABLE",13,10]
+                GOTO wait_disconnect    ' Wait until input pin goes low
+            ENDIF
+    
+        ' Exit programming if all zeros received (cable pulled)
+        CASE $00                        ' 0 (null) indicates input line low
+            ' Check for null in next two locations
+            IF(prog_data[1] = 0) AND (prog_data[2] = 0) Then
+                GOTO wait_disconnect    ' Wait until input pin goes low (probably already is)
+            ENDIF
+            
+    END SELECT                          ' End of Parse routine
+
+    ' If it fell through to here, the command didn't parse
+    SEROUT2 progout, 84, ["?",13,10]          ' Send Error
+    GOTO wait_for_entry                 ' Wait for next command
+
+wait_disconnect:
+    if progin = 1 THEN wait_disconnect  ' Exit is futile until disconnected            
+
+exit_prog:
+    LOW LED                             ' LED off
+GOTO start                              ' Reintialize everything and start main loop
+
+
+' This routine reads the ASCII string in the prog_data array and converts
+' to numeric data.  The results are stored in the same prog_data array, but
+' only in the odd locations.  Each character is validated to make sure that
+' it means something numerically.  If an error is encountered, the location
+' of the error is placed in input_error.  This allows the calling routine to 
+' ignore errors that are beyond the length of the expected data.
+hexify:
+    input_error = $FF                       ' Initialize variable location to 255
+    For data_byte = 3 to 9 STEP 2           ' Step through the odd locations of the array
+        SELECT CASE prog_data[data_byte]    ' Validate that the character can be interpreted as HEX
+            CASE IS < 48                    ' If it's before "0" in the ASCII chart, it's no good
+                input_error = data_byte     ' Record the error location
+                RETURN                      ' We're done
+            CASE IS < 58                    ' If it's "0" to "9", it's OK
+                ' Convert the character to a numeric value and put it back in the array
+                prog_data[data_byte] = prog_data[data_byte] - 48
+            CASE IS < 65                    ' If it's after "9" and before "A", it's no good
+                input_error = data_byte     ' Record the error location
+                RETURN                      ' We're done
+            CASE IS < 71                    ' If it's "A" to "F", it's ok
+                ' Convert the character to a numeric value and put it back in the array
+                prog_data[data_byte] = prog_data[data_byte] - 55
+            CASE ELSE                       ' If it's beyond "F", it's bad
+                input_error = data_byte     ' Record the error location
+                RETURN                      ' We're done
+        END SELECT
+        ' First character is now numeric, but it need to be shoved into the high nibble
+        prog_data[data_byte] = prog_data[data_byte] << 4 
+        ' Validate second character of the byte data
+        SELECT CASE prog_data[data_byte + 1]
+            CASE IS < 48                    ' If it's before "0" in the ASCII chart, it's no good
+                input_error = data_byte     ' Record the error location
+                RETURN                      ' We're done
+            CASE IS < 58                    ' If it's "0" to "9", it's OK
+                ' Convert the character to a numeric value and put it back in the array
+                prog_data[data_byte + 1] = prog_data[data_byte + 1] - 48
+            CASE IS < 65                    ' If it's after "9" and before "A", it's no good
+                input_error = data_byte     ' Record the error location
+                RETURN                      ' We're done
+            CASE IS < 71                    ' If it's "A" to "F", it's ok
+                ' Convert the character to a numeric value and put it back in the array
+                prog_data[data_byte + 1] = prog_data[data_byte + 1] - 55
+            CASE ELSE                       ' If it's beyond "F", it's bad
+                input_error = data_byte     ' Record the error location
+                RETURN                      ' We're done
+        END SELECT
+        ' Now the second character is numeric.  A simple addition puts the total
+        ' numeric value in the array where the first character was originally.
+        ' If locations 9 and 10 were "1" and "A", location 9 becomes $1A.  We 
+        ' don't care what's left in location 10.
+        prog_data[data_byte] = prog_data[data_byte] + prog_data[data_byte + 1]
+    NEXT data_byte                          ' Jump ahead to the next 2 characters
+RETURN                                      ' End of the array, we're done 
+
+    
+End
+
+
+
+
+
+
+
+
+

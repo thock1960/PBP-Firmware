@@ -1,0 +1,53 @@
+'****************************************************************
+'*  Name    : UNTITLED.BAS                                      *
+'*  Author  : [select VIEW...EDITOR OPTIONS]                    *
+'*  Notice  : Copyright (c) 2007 [select VIEW...EDITOR OPTIONS] *
+'*          : All Rights Reserved                               *
+'*  Date    : 5/10/2007                                         *
+'*  Version : 1.0                                               *
+'*  Notes   :                                                   *
+'*          :                                                   *
+'****************************************************************
+sw1	VAR	PORTB.4
+sw2	VAR PORTB.5
+sw3	VAR	PORTB.6
+
+' Define the pins that are connected to LEDs
+led1	VAR	PORTB.0
+led2	VAR	PORTB.1
+led3	VAR	PORTB.2
+
+INTCON2.7 = 0       ' Enable PORTB pull-ups
+TRISB = %11111000	' Set PORTB.0-2 (LEDs) to output, 3-7 to input
+
+intcon.3=1          ' Enables Port B change Interrupt
+gosub FlashLED
+
+main:	' main program begins here
+
+	PORTB = 0		' Turn off all LEDs
+
+	' Check any button pressed to toggle on LED
+	IF sw1 = 0 Then led1 = 1
+	IF sw2 = 0 Then led2 = 1
+	IF sw3 = 0 Then led3 = 1
+    @ sleep
+	'NAP 7			' Go to sleep.  When the watchdog is
+					' disabled, NAP won't wake up until
+					' an interrupt occurs.
+					
+    INTCON.0=0      ' Clear Interrupt flag
+    gosub FlashLED    
+    
+GoTo main		' Do it again upon waking
+
+FlashLED:
+high Led2
+pause 300
+low LED2
+pause 300
+high led2
+pause 300
+low led2
+Return
+

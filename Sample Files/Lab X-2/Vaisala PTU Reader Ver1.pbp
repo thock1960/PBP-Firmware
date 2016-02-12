@@ -1,0 +1,88 @@
+  '****************************************************************************
+'*  Date    : 4/21/2006                                                       *  
+'*  Version : 1.0  Modified version of Rev 5 from ME labs                     *                                         
+'*  Notes   : Firmware for 18F2320 on MELabs LAB-X2 Board                     *
+'*  Update  : Test routine to verify operation of Vaisala PTU module and      *
+'*            change modes from ASCII to Binary                               *
+'*                                                                            *
+'******************************************************************************
+' Define interrupt handler
+DEFINE OSC 20
+ 
+' Aliases for Debugging, can be removed
+CTS         var    PortB.0
+RTS         var    PortB.1
+RX          var    PortC.5
+TX          var    PortC.4
+LED         var    PortB.0 
+
+Data_array  var byte[250]
+Flag_Bin_Mode var   byte
+x           var byte   ' USed as loop counter
+
+INTCON2.7 = 0	' Enable PORTB pull-ups
+
+'------Set LED on PCB to blink in run mode and be ON during RS-232 communications
+input  RTS    ' make CTS an Output and set high
+low CTS       ' make an output and set to 0v
+low LED
+
+' ************************* Main Program Loop ******************************
+loop:
+    If PORTB.4 = 0 Then	' If 3rd button (SW1) pressed start measurment
+        high LED	' Turn on 3rd LED
+        goto PTU_Meas
+    endif
+    If PORTB.5 = 0 Then	' If 3rd button (SW1) pressed start measurment
+        serout2 TX, 32, ["D0",13,10]  ' turn on ASCII Output
+        Flag_Bin_Mode=0
+    endif 
+    If PORTB.6 = 0 Then	' If 3rd button (SW1) pressed start measurment
+        serout2 TX, 32, ["D1",13,10]  ' turn on Binary Output
+        Flag_Bin_Mode=1
+    endif    
+
+    pause 10
+    goto Loop
+    
+' ************** GET PTU Data  *************************
+PTU_Meas:      
+    high CTS
+    serout2 TX, 32, ["M", 13, 10]  ' Start measurment process for PTH data
+    Wait_PTU_Data:  'Get PTU Data
+    IF RTS=1 then Wait_PTU_Data
+    low CTS      'Set CTS line Low       
+    
+    if Flag_Bin_Mode=0 then 
+        serin2 RX, 32, 10, No_PTU_Data, [STR data_array\50\13]
+        x = 0
+        WHILE data_array(x)>0
+            serout2 PortC.6, 32, [Data_array[x]]
+            x=x+1
+        wend
+    endif
+    
+    if Flag_Bin_Mode=1 then
+        serin2 RX, 32, 10, No_PTU_Data, [STR data_array\20]
+        x = 0
+        WHILE x<20
+            serout2 PortC.6, 32, [Data_array[x]]
+            x=x+1
+        wend
+    endif
+        
+    serout2 PortC.6, 32, [13,10]   
+    No_PTU_Data:
+    low LED
+
+GOTO loop           ' Next frame  END of Main Loop
+End
+
+
+
+
+
+
+
+
+

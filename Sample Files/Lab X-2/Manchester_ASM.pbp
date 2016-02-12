@@ -1,0 +1,78 @@
+'****************************************************************
+'*  Name    : Manchester Assembly Routine.BAS                                      *
+'*  Author  : Terry Hock                                        *
+'*  Notice  : Copyright (c) 2006 UCAR                           *
+'*          : All Rights Reserved                               *
+'*  Date    : 12/28/2006                                        *
+'*  Version : 1.0                                               *
+'*  Notes   :                                                   *
+'*          :                                                   *
+'****************************************************************
+
+' Assembly language INTERRUPT handler
+Asm
+myint
+        ; Load the period preset to TMR1 registers
+        ; TMR1 = output_period
+        movf    _output_period + 1, W
+        movwf   TMR1H
+        movf    _output_period, W
+        movwf   TMR1L
+
+; Put the bit out on the port pin
+        rrcf    _output_byte, f ; Move LSB to carry
+        btfss   STATUS, C       ; Is LSB 0?
+        bsf     PORTC, 2        ; Inverted output, if carry is 0 set pin to 1
+        btfsc   STATUS, C       ; Is LSB 1?
+        bcf     PORTC, 2        ; Inverted output, if carry is 1 set to 0
+
+;  Count in order to get a new byte every 8 bits
+        incf    _bit_index, f   ; increment index variable  
+        movf    _bit_index, W   ; Move value to W
+        andlw   7               ; AND to mask high bits (count 0 to 7)
+        bnz     finished        ; If not zero, skip to finished
+
+
+; Read and store the next byte from the buffer      
+        movff   POSTINC2, _output_byte  ; Next value from array using FSR2.
+                                        ; Increment after. POSTINC tells the uP
+                                        ; to goto output byte, read memeory 
+                                        ; location then increment by one.  
+
+; Increment buffer position indicator every other byte
+        btfss   _bit_index, 3   ; Bit-3 of bit_index will toggle as each byte is sent
+        incf    _sending, f     ; Increment variable for use in main loop
+
+
+ ; Check for end of buffer
+        movf    FSR2H,  W
+        sublw   High (_buffer + 300)    ; W = EndH - FSR2H
+
+        bn      reset_fsr       ; if negative (FSR2H > EndH), reset to beginning       
+        bnz     finished        ; if positive (FSR2H < EndH), do nothing else        
+        ; if zero (FSR2H = EndH), fall through to check low byte
+
+        movf    FSR2L, W
+        sublw   Low (_buffer + 300)     ; W = EndL - FSR2L
+        
+        bn      reset_fsr       ; if negative (FSR2L > EndL) reset to beginning
+        bnz     finished        ; if positive (FSR2L < EndL), do nothing else
+        ; if zero (FSR2L = EndL), fall through and reset to beginning
+         
+; Reset FSR2 with the location of the first location in buffer
+reset_fsr
+       bsf PORTA, 2            ; debugging - mark beginning of frame
+        movlw   Low _buffer     ; Move lowbyte of buffer[0] address to W
+        movwf   FSR2L           ; Move W to lowbyte of FSR0
+        movlw   High _buffer    ; Move highbyte of buffer[0] address to W
+        movwf   FSR2H           ; Move W to highbyte of FSR0
+        movlw   255
+        movwf   _sending        ; Reset the byte pointer
+       bcf     PORTA, 2        ; debugging - mark beginning of frame
+
+finished
+        bcf     PIR1, 0         ; clear timer interrupt flag
+        retfie  FAST            ; Return from the interrupt
+
+EndAsm
+

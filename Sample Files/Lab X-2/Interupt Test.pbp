@@ -1,0 +1,42 @@
+'****************************************************************
+'*  Name    : UNTITLED.BAS                                      *
+'*  Author  : [select VIEW...EDITOR OPTIONS]                    *
+'*  Notice  : Copyright (c) 2007 [select VIEW...EDITOR OPTIONS] *
+'*          : All Rights Reserved                               *
+'*  Date    : 5/10/2007                                         *
+'*  Version : 1.0                                               *
+'*  Notes   :                                                   *
+'*          :                                                   *
+'****************************************************************
+GIE     VAR INTCON.7  ' Global interrupt enable 1=ON, 0=OFF
+GPIE    VAR INTCON.3  ' Port change interrupt enable 1=ON, 0=OFF
+GPIF    VAR INTCON.0  ' Port Change Interrupt Flag bit
+LED     VAR GPIO.0    ' LED output GND---/\/\/\---|<|--GPIO.0
+Key     VAR GPIO.3    ' Key input (10K pull-up w/switch to ground)
+X       VAR BYTE      ' G.P.
+
+CMCON = 7             ' All digital
+GPIO = 0              ' Clear port on boot
+TRISIO = %00001000    ' GPIO.3 input, rest outputs
+
+GIE = 0            ' Disable global ints
+GPIE = 1           ' Enable port change int
+IOC.3 = 1          ' Int-on-change for GPIO.3 enabled
+X = GPIO           ' Take a snap shot of port on boot
+	
+Main:
+    X = 10
+    REPEAT
+     TOGGLE LED        ' Toggle LED
+     X = X - 1
+     PAUSE 250
+    UNTIL X = 0
+
+    @ SLEEP            ' SLEEP until Key is pressed
+
+    WHILE Key = 0      ' Wait for Key release
+    WEND
+	
+    GPIF = 0           ' Clear port change interrupt flag
+    GOTO Main
+    END

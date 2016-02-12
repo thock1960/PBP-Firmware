@@ -1,0 +1,66 @@
+'****************************************************************
+'*  Name    : PicBasic Pro program to display "Hello World" on LCD                                      *
+'*  Author  : Terry Hock                                        *
+'*  Notice  : Copyright (c) 2007 UCAR                           *
+'*          : All Rights Reserved                               *
+'*  Date    : 1/17/2007                                         *
+'*  Version : 1.0                                               *
+'*  Notes   :                                                   *
+'*          :                                                   *
+'****************************************************************
+' 
+
+' Define LCD registers and bits
+Define  LCD_DREG        PORTA                                                                   
+Define  LCD_DBIT        0
+Define  LCD_RSREG       PORTA
+Define  LCD_RSBIT       4
+Define  LCD_EREG        PORTB
+Define  LCD_EBIT        3
+
+'  Define Hardware UART
+DEFINE OSC 20
+DEFINE HSER_TXSTA 24h
+DEFINE HSER_RCSTA 90h
+DEFINE HSER_BAUD 115200          ' Match rate of GPS
+
+
+char var	byte		' Storage for serial character
+cnt	 var	byte		' Storage for character counter
+CTS  var    PortB.0
+RTS  var    Portb.5
+
+
+
+cnt = 0			        ' Zero character counter
+CMCON = 7       ' Set PORTA to digital
+'Pause 100       ' Wait for LCD to start up
+'Lcdout $fe, 1   ' Clear screen
+'pause 100       ' wait 100 msec  
+'lcdout "Count:"
+
+high  CTS    ' make CTS an Output and set high
+input RTS
+
+loop:   
+        high CTS
+        Hserout ["M"]
+        pause 10
+        hserout [10]
+        pause 10
+        hserout [13] ' Send char out serial port
+        pause 300
+        Wait_data:
+        if RTS=1 then Wait_data
+        low CTS        
+        Get_data: Hserin 1, allon, [char]	' Get a char from serial port
+        'cnt = cnt + 1		' Increment character count
+        goto Get_data
+        allon:
+ '       Lcdout $fe, $c0, dec2 cnt  ' Display Count        	     
+        cnt=0  
+        Goto loop       ' Do it forever
+        
+
+End
+        
